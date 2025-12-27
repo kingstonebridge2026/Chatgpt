@@ -6,7 +6,7 @@ import ccxt.async_support as ccxt
 from collections import deque
 from datetime import datetime
 
-# ================= CONFIG (STRICTLY PRESERVED / BYBIT KEYS) =================
+# ================= CONFIG (BYBIT KEYS) =================
 BYBIT_API_KEY = "JLcYfu22SuYIzGNuEr"
 BYBIT_SECRET = "otU6K2Q8qnqlfunz47Y6kXSmPca7DZQVLfDx"
 TELEGRAM_TOKEN = "8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA"
@@ -17,13 +17,9 @@ SYMBOLS = ["btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt", "adausdt", "av
 BASE_USD = 25
 TP, SL = 0.0045, 0.0030
 
-# UPDATED: Bybit V5 Testnet WebSocket URL
-WS_URL = "wss://stream-testnet.bybit.com/v5/public/spot"
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("Alpha-HFT")
 
-# ================= THE AI BRAIN (STRICTLY PRESERVED) =================
 class MLFilter:
     def predict(self, rsi, z_score, ofi, trend):
         score = 0
@@ -33,7 +29,6 @@ class MLFilter:
         if trend > 0: score += 20
         return score
 
-# ================= MAIN ENGINE (BYBIT ADAPTED) =================
 class AlphaHFT:
     def __init__(self):
         self.exchange = ccxt.bybit({
@@ -41,22 +36,32 @@ class AlphaHFT:
             'secret': BYBIT_SECRET,
             'enableRateLimit': True,
         })
-        self.exchange.set_sandbox_mode(True) # Points to Testnet
-        
         self.state = {s: {"price_history": deque(maxlen=100), "position": None, "kalman_x": 0.0, "kalman_p": 1.0, "current_price": 0.0, "trade_flow": deque(maxlen=50)} for s in SYMBOLS}
         self.closed_trades = []
         self.tg_id = None
         self.ai = MLFilter()
+        self.ws_url = None
 
-    async def verify_demo_account(self):
-        try:
-            balance = await self.exchange.fetch_balance()
-            usdt = balance['total'].get('USDT', 0)
-            log.info(f"✅ BYBIT DEMO ACTIVE: Your Wallet has ${usdt} USDT")
-            return True
-        except Exception as e:
-            log.error(f"❌ BYBIT AUTH FAILED: {e}")
-            return False
+    async def verify_and_set_env(self):
+        """Checks Testnet first, then falls back to Mainnet if needed."""
+        envs = [
+            {"name": "Testnet", "sandbox": True, "ws": "wss://stream-testnet.bybit.com/v5/public/spot"},
+            {"name": "Mainnet", "sandbox": False, "ws": "wss://stream.bybit.com/v5/public/spot"}
+        ]
+        
+        for env in envs:
+            try:
+                self.exchange.set_sandbox_mode(env["sandbox"])
+                balance = await self.exchange.fetch_balance()
+                usdt = balance['total'].get('USDT', 0)
+                self.ws_url = env["ws"]
+                log.info(f"✅ BYBIT {env['name'].upper()} ACTIVE: Balance ${usdt} USDT")
+                return True
+            except Exception:
+                continue
+        
+        log.error("❌ ALL AUTH ATTEMPTS FAILED. Check: 1. Typos 2. IP Whitelist (208.77.244.24)")
+        return False
 
     def kalman_filter(self, symbol, z):
         s = self.state[symbol]
@@ -73,15 +78,15 @@ class AlphaHFT:
                 active_list = [s.upper() for s, d in self.state.items() if d["position"]]
                 total_floating = sum([(d["current_price"] - d["position"]["entry"]) * d["position"]["amount"] for d in self.state.values() if d["position"]])
                 
-                msg = (f"<b>🤖 AI HFT TOP 20 (BYBIT DEMO)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                       f"<b>Active:</b> {len(active_list)} | <b>Assets:</b> {', '.join(active_list) if active_list else 'None'}\n"
-                       f"<b>Floating P&L:</b> ${total_floating:+.4f}\n<b>Banked PnL:</b> ${total_banked:+.2f}\n"
-                       f"━━━━━━━━━━━━━━━━━━━━\n<b>Update:</b> {datetime.utcnow().strftime('%H:%M:%S')} UTC")
+                msg = (f"<b>🤖 AI HFT TOP 20 (BYBIT)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                       f"<b>Active:</b> {len(active_list)} | <b>PnL:</b> ${total_floating:+.4f}\n"
+                       f"<b>Banked:</b> ${total_banked:+.2f}\n━━━━━━━━━━━━━━━━━━━━\n"
+                       f"<b>Update:</b> {datetime.utcnow().strftime('%H:%M:%S')} UTC")
                 
                 if not self.tg_id:
                     async with session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}) as r:
                         res = await r.json()
-                        self.tg_id = res["result"]["message_id"]
+                        self.tg_id = res.get("result", {}).get("message_id")
                 else:
                     await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": self.tg_id, "text": msg, "parse_mode": "HTML"})
             except: pass
@@ -95,24 +100,22 @@ class AlphaHFT:
                     log.info(f"🌐 SERVER IP: {server_ip} | 📱 DEVICE IP: {USER_DEVICE_IP}")
             except: pass
 
-            if not await self.verify_demo_account():
+            if not await self.verify_and_set_env():
                 await self.exchange.close()
                 return
             
             asyncio.create_task(self.telegram_dashboard(session))
             
             try:
-                async with session.ws_connect(WS_URL) as ws:
-                    # Bybit V5 Subscription logic
+                async with session.ws_connect(self.ws_url) as ws:
                     sub_msg = {"op": "subscribe", "args": [f"publicTrade.{s.upper()}" for s in SYMBOLS]}
                     await ws.send_json(sub_msg)
-                    log.info("🚀 Monitoring Top 20 via Bybit Testnet Stream")
+                    log.info(f"🚀 Monitoring Top 20 via Bybit Stream")
                     
                     async for msg in ws:
                         raw = json.loads(msg.data)
                         if "data" not in raw: continue
                         
-                        # Bybit V5 publicTrade data is a list
                         for trade in raw["data"]:
                             symbol = trade["s"].lower()
                             if symbol not in self.state: continue
@@ -120,8 +123,6 @@ class AlphaHFT:
                             s = self.state[symbol]
                             s["current_price"] = float(trade["p"])
                             s["price_history"].append(s["current_price"])
-                            
-                            # Trade Flow: positive for Buy, negative for Sell
                             flow = float(trade["v"]) if trade["S"] == "Buy" else -float(trade["v"])
                             s["trade_flow"].append(flow)
 
