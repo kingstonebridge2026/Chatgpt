@@ -1,7 +1,9 @@
+
 import asyncio, json, aiohttp, logging, time
 import numpy as np
 import pandas as pd
 import ta
+import ccxt.async_support as ccxt # Added for Demo execution
 from collections import deque
 from datetime import datetime
 import xgboost as xgb
@@ -12,7 +14,6 @@ BINANCE_SECRET = "B7ioAXzVHyYlxPOz3AtxzMC6FQBZaRj6i8A9FenSbsK8rBeCdGZHDhX6Dti22F
 TELEGRAM_TOKEN = "8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA"
 TELEGRAM_CHAT_ID = "5665906172"
 
-# TOP 20 SYMBOLS
 SYMBOLS = [
     "btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt", 
     "adausdt", "avaxusdt", "dogeusdt", "dotusdt", "linkusdt",
@@ -22,8 +23,9 @@ SYMBOLS = [
 
 BASE_USD = 25
 TP, SL = 0.0045, 0.0030
+# Switched to Testnet Stream so signals match Demo Exchange prices
 STREAMS = "/".join([f"{s}@aggTrade" for s in SYMBOLS])
-WS_URL = f"wss://stream.binance.com:9443/stream?streams={STREAMS}"
+WS_URL = f"wss://stream.testnet.binance.vision/stream?streams={STREAMS}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("Alpha-HFT")
@@ -41,6 +43,14 @@ class MLFilter:
 # ================= MULTI-SYMBOL HFT ENGINE =================
 class AlphaHFT:
     def __init__(self):
+        # Initialize Exchange for Demo
+        self.exchange = ccxt.binance({
+            'apiKey': BINANCE_API_KEY,
+            'secret': BINANCE_SECRET,
+            'enableRateLimit': True,
+        })
+        self.exchange.set_sandbox_mode(True) # Forces Demo Trading
+
         self.state = {s: {
             "price_history": deque(maxlen=200),
             "trade_flow": deque(maxlen=100),
@@ -65,10 +75,7 @@ class AlphaHFT:
     async def telegram_dashboard(self, session):
         while True:
             try:
-                # Calculate Total Banked PnL
                 total_banked = sum(self.closed_trades)
-                
-                # Calculate Combined Floating PnL from all active positions
                 total_floating = 0.0
                 active_list = []
                 for s_name, data in self.state.items():
@@ -78,9 +85,8 @@ class AlphaHFT:
                         active_list.append(s_name.upper())
 
                 float_icon = "📈" if total_floating >= 0 else "📉"
-                
                 msg = (
-                    f"<b>🤖 AI HFT TOP 20 ACTIVE</b>\n"
+                    f"<b>🤖 AI HFT TOP 20 ACTIVE (DEMO)</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"<b>Active Trades:</b> {len(active_list)}\n"
                     f"<b>Assets:</b> {', '.join(active_list) if active_list else 'None'}\n"
@@ -113,7 +119,7 @@ class AlphaHFT:
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(self.telegram_dashboard(session))
             async with session.ws_connect(WS_URL) as ws:
-                log.info("Top 20 Stream Connected with Floating P&L Monitor")
+                log.info("Top 20 Demo Stream Connected")
                 async for msg in ws:
                     raw_data = json.loads(msg.data)
                     stream_name = raw_data['stream'].split('@')[0]
@@ -128,24 +134,34 @@ class AlphaHFT:
 
                     if len(s["price_history"]) < 50: continue
 
-                    # AI Features
                     rsi = ta.momentum.rsi(pd.Series(list(s["price_history"])), window=14).iloc[-1]
                     z_score = (s["current_price"] - np.mean(s["price_history"])) / (np.std(s["price_history"]) + 1e-10)
                     ofi = sum(s["trade_flow"])
                     trend = self.kalman_filter(stream_name, s["current_price"])
 
-                    # Trade Logic
+                    # Trade Logic with Execution
                     if not s["position"]:
                         if self.ai.predict(rsi, z_score, ofi, trend) >= 80:
-                            s["position"] = {"entry": s["current_price"], "amount": BASE_USD / s["current_price"]}
-                            log.info(f"AI BUY: {stream_name.upper()} at {s['current_price']}")
+                            try:
+                                symbol_ccxt = stream_name.upper().replace("USDT", "/USDT")
+                                amount = BASE_USD / s["current_price"]
+                                await self.exchange.create_market_buy_order(symbol_ccxt, amount)
+                                s["position"] = {"entry": s["current_price"], "amount": amount}
+                                log.info(f"DEMO BUY: {stream_name.upper()} at {s['current_price']}")
+                            except Exception as e:
+                                log.error(f"Buy Order Failed: {e}")
 
                     elif s["position"]:
                         pnl_pct = (s["current_price"] - s["position"]["entry"]) / s["position"]["entry"]
                         if pnl_pct >= TP or pnl_pct <= -SL:
-                            self.closed_trades.append((s["current_price"] - s["position"]["entry"]) * s["position"]["amount"])
-                            log.info(f"EXIT {stream_name.upper()} | PnL: {pnl_pct:.4f}")
-                            s["position"] = None
+                            try:
+                                symbol_ccxt = stream_name.upper().replace("USDT", "/USDT")
+                                await self.exchange.create_market_sell_order(symbol_ccxt, s["position"]["amount"])
+                                self.closed_trades.append((s["current_price"] - s["position"]["entry"]) * s["position"]["amount"])
+                                log.info(f"DEMO EXIT {stream_name.upper()} | PnL: {pnl_pct:.4f}")
+                                s["position"] = None
+                            except Exception as e:
+                                log.error(f"Sell Order Failed: {e}")
 
 if __name__ == "__main__":
     bot = AlphaHFT()
