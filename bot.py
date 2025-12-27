@@ -11,7 +11,7 @@ BYBIT_API_KEY = "JLcYfu22SuYIzGNuEr"
 BYBIT_SECRET = "otU6K2Q8qnqlfunz47Y6kXSmPca7DZQVLfDx"
 TELEGRAM_TOKEN = "8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA"
 TELEGRAM_CHAT_ID = "5665906172"
-USER_DEVICE_IP = "176.123.17.227"
+//USER_DEVICE_IP = "176.123.17.227"
 
 SYMBOLS = ["btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt", "adausdt", "avaxusdt", "dogeusdt", "dotusdt", "linkusdt", "polusdt", "nearusdt", "ltcusdt", "uniusdt", "aptusdt", "arbusdt", "opusdt", "injusdt", "tiausdt", "suiusdt"]
 BASE_USD = 25
