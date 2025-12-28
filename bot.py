@@ -1,4 +1,4 @@
-import asyncio, json, aiohttp, logging
+import asyncio, json, aiohttp, logging, time
 import numpy as np
 import pandas as pd
 import ta
@@ -19,8 +19,8 @@ SYMBOLS = [
     "ARBUSDT","OPUSDT","INJUSDT","TIAUSDT","SUIUSDT"
 ]
 
-BASE_USD = 25
-TP, SL = 0.0055, 0.0035 # Adjusted slightly for fee headroom
+BASE_USD = 20 # Using $20 to allow for 5 simultaneous trades with $100 balance
+TP, SL = 0.0060, 0.0035 # Adjusted for fee headroom (Bybit Spot is ~0.1%)
 WS_URL = "wss://stream-testnet.bybit.com/v5/public/spot"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -28,18 +28,18 @@ log = logging.getLogger("Alpha-HFT")
 
 # ================= ENHANCED AI BRAIN =================
 class MLFilter:
-    def predict(self, rsi, z_score, ofi, trend, volatility_squeeze):
+    def predict(self, rsi, z, ofi, ema_signal, squeeze):
         score = 0
-        # 1. Momentum Check
+        # 1. RSI Oversold (Lowered threshold to 35 for more frequency)
         if rsi < 35: score += 25
-        # 2. Mean Reversion / Breakout Check
-        if z_score < -1.5: score += 25
-        # 3. Order Flow (Sensitive to smaller shifts)
+        # 2. Z-Score (Distance from Mean - Catching the snap-back)
+        if z < -1.3: score += 25
+        # 3. Order Flow (Buying pressure intensity)
         if ofi > 0: score += 20
-        # 4. Trend Confirmation
-        if trend > 0: score += 15
-        # 5. Volatility Squeeze (High probability entry)
-        if volatility_squeeze: score += 15
+        # 4. Micro-Trend (EMA 9 > EMA 21)
+        if ema_signal > 0: score += 15
+        # 5. Volatility Squeeze (Anticipating the breakout)
+        if squeeze: score += 15
         
         return score
 
@@ -77,9 +77,8 @@ class AlphaHFT:
         try:
             bal = await self.exchange.fetch_balance()
             usdt = bal["total"].get("USDT", 0)
-            log.info(f"✅ DEMO OK | USDT: {usdt}")
-        except Exception as e:
-            log.error(f"Balance Check Error: {e}")
+            log.info(f"✅ ACCOUNT READY | USDT: {usdt}")
+        except Exception as e: log.error(f"Balance Check Failed: {e}")
 
     def kalman_filter(self, symbol, z):
         s = self.state[symbol]
@@ -93,15 +92,15 @@ class AlphaHFT:
         while True:
             try:
                 total_banked = sum(self.closed_trades)
-                active_trades = [d for d in self.state.values() if d["position"]]
-                total_floating = sum((d["current_price"] - d["position"]["entry"]) * d["position"]["amount"] for d in active_trades)
+                active = [d for d in self.state.values() if d["position"]]
+                total_floating = sum((d["current_price"] - d["position"]["entry"]) * d["position"]["amount"] for d in active)
 
                 msg = (
-                    f"<b>🤖 ALPHA AI HFT (BYBIT)</b>\n"
+                    f"<b>🤖 ALPHA HFT ENGINE (BYBIT)</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>Active:</b> {len(active_trades)} | <b>Banked:</b> ${total_banked:+.2f}\n"
-                    f"<b>Floating:</b> ${total_floating:+.4f}\n"
-                    f"<b>Win Rate:</b> {self.get_win_rate()}%\n"
+                    f"<b>Active Trades:</b> {len(active)} | <b>Banked:</b> ${total_banked:+.2f}\n"
+                    f"<b>Floating P&L:</b> ${total_floating:+.4f}\n"
+                    f"<b>Target Score:</b> 65+ | <b>Mode:</b> HFT-Aggressive\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
                 )
@@ -115,17 +114,12 @@ class AlphaHFT:
             except: pass
             await asyncio.sleep(10)
 
-    def get_win_rate(self):
-        if not self.closed_trades: return 0
-        wins = [t for t in self.closed_trades if t > 0]
-        return round((len(wins) / len(self.closed_trades)) * 100, 1)
-
     async def ws_loop(self, session):
         while True:
             try:
                 async with session.ws_connect(WS_URL, heartbeat=20) as ws:
                     await ws.send_json({"op": "subscribe", "args": [f"publicTrade.{s}" for s in SYMBOLS]})
-                    log.info("🚀 AI-HFT WebSocket Online")
+                    log.info("🚀 Monitoring Ticker Stream...")
 
                     async for msg in ws:
                         raw = json.loads(msg.data)
@@ -141,44 +135,53 @@ class AlphaHFT:
 
                             if len(s["price_history"]) < 30: continue
 
-                            # --- AI FEATURE ENGINEERING ---
+                            # --- AI FEATURE CALCULATIONS ---
                             prices = pd.Series(s["price_history"])
                             rsi = ta.momentum.rsi(prices, 14).iloc[-1]
-                            std = np.std(s["price_history"])
-                            z = (price - np.mean(s["price_history"])) / (std + 1e-9)
-                            trend = self.kalman_filter(symbol, price)
-                            ofi = sum(s["trade_flow"])
+                            z = (price - np.mean(s["price_history"])) / (np.std(s["price_history"]) + 1e-9)
                             
-                            # Bollinger Band Squeeze (AI enhancement)
-                            upper_bb = ta.volatility.bollinger_hband(prices, 20, 2).iloc[-1]
-                            lower_bb = ta.volatility.bollinger_lband(prices, 20, 2).iloc[-1]
-                            squeeze = (upper_bb - lower_bb) / price < 0.002 # 0.2% squeeze
+                            # Micro-Trend (EMA 9/21)
+                            ema9 = ta.trend.ema_indicator(prices, 9).iloc[-1]
+                            ema21 = ta.trend.ema_indicator(prices, 21).iloc[-1]
+                            ema_signal = 1 if ema9 > ema21 else -1
+                            
+                            # Volatility Squeeze
+                            bb_h = ta.volatility.bollinger_hband(prices, 20, 2).iloc[-1]
+                            bb_l = ta.volatility.bollinger_lband(prices, 20, 2).iloc[-1]
+                            squeeze = (bb_h - bb_l) / price < 0.0018 # 0.18% width is a tight squeeze
 
-                            symbol_ccxt = f"{symbol[:-4]}/USDT"
+                            ofi = sum(s["trade_flow"])
+                            symbol_ccxt = f"{symbol[:-4]}/USDT" # BTCUSDT -> BTC/USDT
 
-                            # --- EXECUTION LOGIC ---
+                            # --- EXECUTION ---
                             if not s["position"]:
-                                score = self.ai.predict(rsi, z, ofi, trend, squeeze)
-                                if score >= 75: # Lowered slightly for HFT frequency
+                                score = self.ai.predict(rsi, z, ofi, ema_signal, squeeze)
+                                if score >= 65: # Lowered from 80 to 65 for higher frequency
                                     qty = BASE_USD / price
                                     try:
-                                        await self.exchange.create_market_buy_order(symbol_ccxt, qty)
+                                        await self.exchange.create_order(
+                                            symbol_ccxt, 'market', 'buy', qty,
+                                            params={'category': 'spot'}
+                                        )
                                         s["position"] = {"entry": price, "amount": qty}
-                                        log.info(f"🚀 AI BUY {symbol_ccxt} | Score: {score}")
-                                    except Exception as e: log.error(f"Buy Error: {e}")
+                                        log.info(f"🚀 BUY {symbol_ccxt} | Score: {score}")
+                                    except Exception as e: log.error(f"Buy Fail: {e}")
 
                             elif s["position"]:
                                 pnl = (price - s["position"]["entry"]) / s["position"]["entry"]
                                 if pnl >= TP or pnl <= -SL:
                                     try:
-                                        await self.exchange.create_market_sell_order(symbol_ccxt, s["position"]["amount"])
+                                        await self.exchange.create_order(
+                                            symbol_ccxt, 'market', 'sell', s["position"]["amount"],
+                                            params={'category': 'spot'}
+                                        )
                                         self.closed_trades.append((price - s["position"]["entry"]) * s["position"]["amount"])
-                                        log.info(f"💰 AI SELL {symbol_ccxt} | PnL: {pnl:+.4f}")
+                                        log.info(f"💰 SELL {symbol_ccxt} | PnL: {pnl:+.4f}")
                                         s["position"] = None
-                                    except Exception as e: log.error(f"Sell Error: {e}")
+                                    except Exception as e: log.error(f"Sell Fail: {e}")
 
             except Exception as e:
-                log.error(f"WS Sync Lost: {e}")
+                log.error(f"WS Sync Error: {e}")
                 await asyncio.sleep(5)
 
     async def run(self):
