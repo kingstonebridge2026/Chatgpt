@@ -27,7 +27,7 @@ SYMBOLS = [
 ]
 
 BASE_USD = 20  # USDT allocation per trade
-WS_URL = "wss://testnet.binance.vision/ws"
+WS_URL = "wss://demo-stream.binance.com/ws"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("Alpha-HFT")
