@@ -7,8 +7,8 @@ from collections import deque
 from datetime import datetime
 
 # ================= CONFIG =================
-BYBIT_API_KEY = "JLcYfu22SuYIzGNuEr"
-BYBIT_SECRET = "otU6K2Q8qnqlfunz47Y6kXSmPca7DZQVLfDx"
+BYBIT_API_KEY = "UYr9b62FtiRiN9hHue"
+BYBIT_SECRET = "rUDdj0QM2lQJQjVY1EeoUuPw29LldrNLtzKI"
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 BASE_USD = 25
