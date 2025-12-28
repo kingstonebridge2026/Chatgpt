@@ -13,91 +13,168 @@ TELEGRAM_TOKEN = "8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA"
 TELEGRAM_CHAT_ID = "5665906172"
 
 SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","AVAXUSDT","DOGEUSDT","DOTUSDT","LINKUSDT"]
-
-BASE_USD = 20  # Total USDT per trade
+BASE_USD = 20
+TP, SL = 0.006, 0.003
 WS_URL = "wss://stream-testnet.bybit.com/v5/public/spot"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("Alpha-HFT")
 
+# ================= AI BRAIN =================
+class MLFilter:
+    def predict(self, rsi, z, ofi, ema_signal, squeeze):
+        score = 0
+        if rsi < 35: score += 25
+        if z < -1.3: score += 25
+        if ofi > 0: score += 20
+        if ema_signal > 0: score += 15
+        if squeeze: score += 15
+        return score
+
+# ================= HFT ENGINE =================
 class AlphaHFT:
     def __init__(self):
         self.exchange = ccxt.bybit({
             "apiKey": BYBIT_API_KEY,
             "secret": BYBIT_SECRET,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"}
+            "options": {"defaultType": "spot", "accountType": "UNIFIED"}
         })
-        self.exchange.set_sandbox_mode(True) # Force Testnet logic
-        
-        self.state = {s: {"price_history": deque(maxlen=50), "trade_flow": deque(maxlen=20), "position": None} for s in SYMBOLS}
+        # Testnet
+        self.exchange.urls['api'] = {
+            'public': 'https://api-testnet.bybit.com',
+            'private': 'https://api-testnet.bybit.com',
+        }
+
+        self.state = {s: {"price_history": deque(maxlen=50),
+                          "trade_flow": deque(maxlen=20),
+                          "position": None,
+                          "kalman_x": 0.0,
+                          "kalman_p": 1.0,
+                          "current_price": 0.0
+                          } for s in SYMBOLS}
         self.closed_trades = []
+        self.tg_id = None
+        self.ai = MLFilter()
+
+    async def verify_balance(self):
+        try:
+            await self.exchange.load_markets()
+            bal = await self.exchange.fetch_balance()
+            usdt = bal["total"].get("USDT", 0)
+            log.info(f"✅ ACCOUNT READY | USDT: {usdt}")
+            return usdt
+        except Exception as e:
+            log.error(f"❌ Balance Check Failed: {e}")
+            return 0
+
+    def kalman_filter(self, symbol, z):
+        s = self.state[symbol]
+        s["kalman_p"] += 0.0001
+        k = s["kalman_p"] / (s["kalman_p"] + 0.01)
+        s["kalman_x"] += k * (z - s["kalman_x"])
+        s["kalman_p"] *= (1 - k)
+        return s["kalman_x"]
+
+    async def telegram_dashboard(self, session):
+        while True:
+            try:
+                total_banked = sum(self.closed_trades)
+                active = [d for d in self.state.values() if d["position"]]
+                total_floating = sum((d["current_price"] - d["position"]["entry"]) * d["position"]["amount"] for d in active)
+
+                msg = (
+                    f"<b>🤖 ALPHA HFT ENGINE (BYBIT DEMO)</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>Active Trades:</b> {len(active)} | <b>Banked:</b> ${total_banked:+.2f}\n"
+                    f"<b>Floating P&L:</b> ${total_floating:+.4f}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+                )
+
+                if not self.tg_id:
+                    r = await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                                           json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"})
+                    res = await r.json()
+                    if res.get("ok"): self.tg_id = res["result"]["message_id"]
+                else:
+                    await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
+                                       json={"chat_id": TELEGRAM_CHAT_ID,
+                                             "message_id": self.tg_id,
+                                             "text": msg,
+                                             "parse_mode": "HTML"})
+            except: pass
+            await asyncio.sleep(10)
+
+    async def ws_loop(self, session):
+        while True:
+            try:
+                async with session.ws_connect(WS_URL, heartbeat=20) as ws:
+                    await ws.send_json({"op": "subscribe", "args": [f"publicTrade.{s}" for s in SYMBOLS]})
+                    log.info("🚀 Monitoring Ticker Stream...")
+
+                    async for msg in ws:
+                        raw = json.loads(msg.data)
+                        if "data" not in raw: continue
+
+                        for t in raw["data"]:
+                            symbol = t["s"]
+                            price = float(t["p"])
+                            s = self.state[symbol]
+                            s["current_price"] = price
+                            s["price_history"].append(price)
+                            s["trade_flow"].append(float(t["v"]) if t["S"] == "Buy" else -float(t["v"]))
+
+                            if len(s["price_history"]) < 5: continue
+
+                            prices = pd.Series(s["price_history"])
+                            rsi = ta.momentum.rsi(prices, min(14, len(prices))).iloc[-1]
+                            z = (price - np.mean(s["price_history"])) / (np.std(s["price_history"]) + 1e-9)
+
+                            ema9 = ta.trend.ema_indicator(prices, 9).iloc[-1]
+                            ema21 = ta.trend.ema_indicator(prices, 21).iloc[-1]
+                            ema_signal = 1 if ema9 > ema21 else -1
+                            bb_h = ta.volatility.bollinger_hband(prices, 20, 2).iloc[-1]
+                            bb_l = ta.volatility.bollinger_lband(prices, 20, 2).iloc[-1]
+                            squeeze = (bb_h - bb_l) / price < 0.0018
+                            ofi = sum(s["trade_flow"])
+
+                            symbol_ccxt = f"{symbol[:-4]}/USDT"
+
+                            # BUY
+                            if not s["position"]:
+                                score = self.ai.predict(rsi, z, ofi, ema_signal, squeeze)
+                                if score >= 60:  # slightly lower to trigger trades
+                                    raw_qty = BASE_USD / price
+                                    qty = float(self.exchange.amount_to_precision(symbol_ccxt, raw_qty))
+                                    try:
+                                        await self.exchange.create_order(symbol_ccxt, 'market', 'buy', qty,
+                                                                         params={'wallet': 'unified'})
+                                        s["position"] = {"entry": price, "amount": qty}
+                                        log.info(f"✅ BUY {symbol_ccxt} | Score: {score}")
+                                    except Exception as e: log.error(f"❌ Buy Fail: {e}")
+
+                            # SELL
+                            elif s["position"]:
+                                pnl = (price - s["position"]["entry"]) / s["position"]["entry"]
+                                if pnl >= TP or pnl <= -SL:
+                                    try:
+                                        await self.exchange.create_order(symbol_ccxt, 'market', 'sell', s["position"]["amount'],
+                                                                         params={'wallet': 'unified'})
+                                        self.closed_trades.append((price - s["position"]["entry"]) * s["position"]["amount"])
+                                        log.info(f"💰 SELL {symbol_ccxt} | PnL: {pnl:+.4f}")
+                                        s["position"] = None
+                                    except Exception as e: log.error(f"❌ Sell Fail: {e}")
+
+            except Exception as e:
+                log.error(f"WS Sync Error: {e}")
+                await asyncio.sleep(5)
 
     async def run(self):
-        # 1. Load markets to get precision rules
-        await self.exchange.load_markets()
-        log.info("✅ Markets Loaded. Starting Engine...")
-
+        await self.verify_balance()
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(WS_URL) as ws:
-                await ws.send_json({"op": "subscribe", "args": [f"publicTrade.{s}" for s in SYMBOLS]})
-                
-                async for msg in ws:
-                    raw = json.loads(msg.data)
-                    if "data" not in raw: continue
-
-                    for t in raw["data"]:
-                        symbol = t['s']
-                        price = float(t["p"])
-                        s = self.state[symbol]
-                        s["price_history"].append(price)
-                        s["trade_flow"].append(float(t["v"]) if t["S"] == "Buy" else -float(t["v"]))
-
-                        if len(s["price_history"]) < 5: continue # Ultra-fast start
-
-                        # --- AI SIGNAL ---
-                        prices = pd.Series(s["price_history"])
-                        rsi = ta.momentum.rsi(prices, len(prices) if len(prices) < 14 else 14).iloc[-1]
-                        z = (price - np.mean(s["price_history"])) / (np.std(s["price_history"]) + 1e-9)
-                        
-                        # LOG EVERYTHING TO SEE WHY IT ISN'T TRADING
-                        score = 0
-                        if rsi < 50: score += 40 
-                        if z < 0: score += 40
-                        if sum(s["trade_flow"]) > 0: score += 20
-                        
-                        # log.info(f"{symbol} | Score: {score} | RSI: {rsi:.1f} | Z: {z:.2f}")
-
-                        symbol_ccxt = f"{symbol[:-4]}/USDT"
-                        if not s["position"] and score >= 70:
-                            try:
-                                # FIX: Calculate QTY with correct exchange precision
-                                market = self.exchange.market(symbol_ccxt)
-                                raw_qty = BASE_USD / price
-                                qty = self.exchange.amount_to_precision(symbol_ccxt, raw_qty)
-                                
-                                log.info(f"🚀 ATTEMPTING BUY: {symbol_ccxt} Qty: {qty}")
-                                order = await self.exchange.create_order(
-                                    symbol_ccxt, 'market', 'buy', qty, 
-                                    params={'category': 'spot'}
-                                )
-                                s["position"] = {"entry": price, "amount": qty}
-                                log.info(f"✅ SUCCESS: {symbol_ccxt} Filled")
-                            except Exception as e:
-                                log.error(f"❌ ORDER REJECTED: {e}")
-
-                        elif s["position"]:
-                            pnl = (price - s["position"]["entry"]) / s["position"]["entry"]
-                            if pnl >= 0.005 or pnl <= -0.003: # 0.5% TP / 0.3% SL
-                                try:
-                                    await self.exchange.create_order(
-                                        symbol_ccxt, 'market', 'sell', s["position"]["amount"],
-                                        params={'category': 'spot'}
-                                    )
-                                    log.info(f"💰 PROFIT TAKEN: {pnl:+.4f}")
-                                    s["position"] = None
-                                except Exception as e: log.error(f"Exit Fail: {e}")
+            asyncio.create_task(self.telegram_dashboard(session))
+            await self.ws_loop(session)
 
 if __name__ == "__main__":
     asyncio.run(AlphaHFT().run())
- 
