@@ -31,7 +31,7 @@ class MLSentimentTrader:
 
     async def update_global_sentiment(self):
         """Fetches the latest crypto news and updates the mood score."""
-        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_API_KEY}&public=true"
+        url = f"https://cryptopanic.com/api/posts/?auth_token={CRYPTOPANIC_API_KEY}&public=true"
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
