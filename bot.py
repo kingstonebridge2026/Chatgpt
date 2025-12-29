@@ -12,7 +12,14 @@ SYMBOL = 'BTC/USDT'
 LEVERAGE = 10
 
 # Initialize
-exchange = ccxt.binance({'apiKey': API_KEY, 'secret': SECRET_KEY, 'enableRateLimit': True})
+exchange = ccxt.binance({
+    'apiKey': API_KEY,
+    'secret': SECRET_KEY,
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'future'
+    }
+})
 tg_bot = Bot(token=TELEGRAM_TOKEN)
 
 class PropBot:
