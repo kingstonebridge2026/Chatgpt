@@ -28,23 +28,40 @@ class MLSentimentTrader:
         )
         self.metric = metrics.Accuracy()
         self.state = {s: {"price_history": deque(maxlen=100), "position": None} for s in SYMBOLS}
-
     async def update_global_sentiment(self):
-        """Fetches the latest crypto news and updates the mood score."""
-        url = f"https://cryptopanic.com/api/posts/?auth_token={CRYPTOPANIC_API_KEY}&public=true"
+        """Fetches news and updates sentiment using the correct CryptoPanic format."""
+        # Use the base posts endpoint as per docs
+        url = "https://cryptopanic.com/api/v1/posts/"
+        params = {
+            "auth_token": CRYPTOPANIC_API_KEY,
+            "public": "true",
+            "kind": "news" # Filter for actual news articles
+        }
+        
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url) as response:
-                        data = await response.json()
-                        titles = [post['title'] for post in data['results'][:10]]
-                        # Calculate average sentiment of the top 10 news items
-                        scores = [self.sia.polarity_scores(t)['compound'] for t in titles]
-                        self.current_sentiment = np.mean(scores)
-                        logging.info(f"📰 Market Sentiment Updated: {self.current_sentiment:+.2f}")
+                    # Passing params as a dict handles encoding correctly
+                    async with session.get(url, params=params) as response:
+                        if response.status == 200:
+                            # content_type=None avoids the mimetype error
+                            data = await response.json(content_type=None)
+                            results = data.get('results', [])
+                            
+                            if results:
+                                titles = [post['title'] for post in results[:10]]
+                                scores = [self.sia.polarity_scores(t)['compound'] for t in titles]
+                                self.current_sentiment = np.mean(scores)
+                                log.info(f"📰 Sentiment Analysis Complete: {self.current_sentiment:+.2f}")
+                        else:
+                            log.warning(f"⚠️ CryptoPanic API Status {response.status}. Check API Key.")
+                            
             except Exception as e:
-                logging.error(f"News Error: {e}")
-            await asyncio.sleep(300) # Update news every 5 minutes
+                log.error(f"🌐 News Module connectivity issue: {e}")
+            
+            # Update every 10 minutes to stay safely within free-tier limits
+            await asyncio.sleep(600)
+
 
     def get_features(self, symbol):
         s = self.state[symbol]
