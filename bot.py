@@ -12,14 +12,22 @@ SYMBOL = 'BTC/USDT'
 LEVERAGE = 10
 
 # Initialize
-exchange = ccxt.binance({
-    'apiKey': API_KEY,
-    'secret': SECRET_KEY,
+
+
+exchange = ccxt.binanceusdm({
+    'apiKey': 'p4FKZRHA26Z3VWyRPF5xZFc3aDU8vxTy7OCULtX7wCgN6l3EaNl882q4JzruPIsE',
+    'secret': 'CXqJa5JaKxwVPT5ik3EBbB2Mm0IMp4J0I0OSEY1Q6SKk7PkWHwf7tyDBhxKwLn1b',
     'enableRateLimit': True,
-    'options': {
-        'defaultType': 'future'
-    }
 })
+
+
+exchange = ccxt.binancecoinm({
+    'apiKey': 'p4FKZRHA26Z3VWyRPF5xZFc3aDU8vxTy7OCULtX7wCgN6l3EaNl882q4JzruPIsE',
+    'secret': 'CXqJa5JaKxwVPT5ik3EBbB2Mm0IMp4J0I0OSEY1Q6SKk7PkWHwf7tyDBhxKwLn1b',
+    'enableRateLimit': True,
+})
+
+
 tg_bot = Bot(token=TELEGRAM_TOKEN)
 
 class PropBot:
