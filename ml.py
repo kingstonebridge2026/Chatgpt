@@ -8,7 +8,6 @@ API_SECRET = '2LfotApekUjBH6jScuzj1c47eEnq1ViXsNRIP4ydYqYWl6brLhU3JY4vqlftnUIo'
 TG_TOKEN = '8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA'
 TG_CHAT_ID = '5665906172'
 
-# Global filter cache to prevent constant API calls
 symbol_filters = {}
 active_positions = {}
 
@@ -21,108 +20,83 @@ async def send_tg_async(msg):
     except: pass
 
 async def setup_filters(client):
-    """Fetches trading rules for all coins to avoid 'Filter Failure' errors"""
     info = await client.get_exchange_info()
     for s in info['symbols']:
         f = {filt['filterType']: filt for filt in s['filters']}
         symbol_filters[s['symbol']] = {
             'step': float(f['LOT_SIZE']['stepSize']),
-            'minQty': float(f['LOT_SIZE']['minQty']),
             'minNotional': float(f.get('MIN_NOTIONAL', f.get('NOTIONAL', {'minNotional': 5}))['minNotional'])
         }
     return [s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')][:100]
 
 def format_quantity(symbol, quantity):
-    """Adjusts the amount to match Binance's strict decimal rules"""
-    filt = symbol_filters[symbol]
-    step = filt['step']
+    step = symbol_filters[symbol]['step']
     precision = int(round(-math.log(step, 10), 0))
-    # Round down to ensure we don't exceed balance
     qty = math.floor(quantity / step) * step
     return round(qty, precision)
 
 async def get_elite_signals(client, symbol):
-    # Reduced limit to 20 for extreme speed
     klines = await client.get_klines(symbol=symbol, interval='1m', limit=20)
     df = pd.DataFrame(klines, columns=['t','o','h','l','c','v','ct','qav','nt','tbv','tqv','i']).astype(float)
-    
-    # Volume Delta + OBI
     df['delta'] = df['tbv'] - (df['v'] - df['tbv'])
-    avg_delta = df['delta'].mean()
     
     depth = await client.get_order_book(symbol=symbol, limit=10)
     bid_v = sum([float(b[1]) for b in depth['bids']])
     ask_v = sum([float(a[1]) for a in depth['asks']])
     obi = (bid_v - ask_v) / (bid_v + ask_v)
     
-    # Statistical Mean Reversion
-    tp = (df['h'] + df['l'] + df['c']) / 3
-    vwap = (tp * df['v']).sum() / (df['v'].sum() + 0.0001)
     z_score = (df['c'].iloc[-1] - df['c'].mean()) / (df['c'].std() + 0.00001)
-    
-    return z_score, obi, vwap, df['delta'].iloc[-1], avg_delta, df['c'].iloc[-1]
+    return z_score, obi, df['delta'].iloc[-1], df['c'].iloc[-1]
 
 async def trade_logic(client, symbol):
-    usd_per_trade = 5.5 # Slightly above $5 minimum for safety
-    max_slots = 18 
+    # --- COMPOUNDING SETTINGS ---
+    # We split our total balance into 15 "slots"
+    # If balance is $100 -> $6.66 per trade. If $200 -> $13.33 per trade.
+    total_slots = 15 
 
     while True:
         try:
-            z, obi, vwap, delta, avg_delta, price = await get_elite_signals(client, symbol)
+            z, obi, delta, price = await get_elite_signals(client, symbol)
             
-            # --- THE "ACTION" ENGINE ---
-            if symbol not in active_positions and len(active_positions) < max_slots:
-                # Optimized for high frequency: Z < -1.5, OBI > 0.1
+            if symbol not in active_positions and len(active_positions) < total_slots:
                 if z < -1.5 and obi > 0.1 and delta > 0:
-                    qty = format_quantity(symbol, usd_per_trade / price)
+                    # DYNAMIC COMPOUNDING CALCULATION
+                    acc = await client.get_account()
+                    usdt_free = float(next(i['free'] for i in acc['balances'] if i['asset'] == 'USDT'))
                     
-                    # Ensure it meets min notional ($5+)
-                    if (qty * price) > symbol_filters[symbol]['minNotional']:
+                    # Allocate portion of balance to this trade
+                    usd_to_spend = (usdt_free / (total_slots - len(active_positions))) * 0.95 
+                    
+                    if usd_to_spend > symbol_filters[symbol]['minNotional']:
+                        qty = format_quantity(symbol, usd_to_spend / price)
                         await client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
                         active_positions[symbol] = {'p': price, 'q': qty}
-                        await send_tg_async(f"🚀 *ELITE ENTRY:* {symbol}\nPrice: `{price}` | Z: `{z:.2f}`")
+                        await send_tg_async(f"🚀 *COMPOUND ENTRY:* {symbol}\nSize: `${usd_to_spend:.2f}` | Z: `{z:.2f}`")
 
-            # --- THE SCALP EXIT ---
             elif symbol in active_positions:
                 buy_p = active_positions[symbol]['p']
                 qty_pos = active_positions[symbol]['q']
                 
-                # Exit at 0.2% Profit or Overbought Z-Score
-                if z > 1.3 or price > (buy_p * 1.002):
+                # Take Profit (0.2%) OR Stop Loss (0.7% for sleep protection)
+                if price > (buy_p * 1.002) or z > 1.3:
                     await client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty_pos)
-                    prof = (price - buy_p) * qty_pos
                     del active_positions[symbol]
-                    await send_tg_async(f"💰 *SCALP PROFIT:* {symbol}\nGain: `+{prof:.4f} USDT`")
+                    await send_tg_async(f"💰 *PROFIT HARVEST:* {symbol}")
+                
+                elif price < (buy_p * 0.993): # Hard Stop Loss
+                    await client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty_pos)
+                    del active_positions[symbol]
+                    await send_tg_async(f"⚠️ *STOP LOSS:* {symbol} (Market too volatile)")
 
-            await asyncio.sleep(3) # Safe scan for 100 symbols
-        except Exception:
-            await asyncio.sleep(5)
-
-async def monitor_portfolio(client):
-    """Sends a Live P&L and Balance summary every 60s"""
-    while True:
-        try:
-            acc = await client.get_account()
-            bal = next((i['free'] for i in acc['balances'] if i['asset'] == 'USDT'), 0)
-            pnl = 0
-            for s, d in active_positions.items():
-                t = await client.get_symbol_ticker(symbol=s)
-                pnl += (float(t['price']) - d['p']) * d['q']
-            
-            await send_tg_async(f"📊 *STATUS UPDATE*\nUSDT: `{float(bal):.2f}`\nPositions: `{len(active_positions)}` | Float: `{pnl:.4f}`")
-            await asyncio.sleep(60)
-        except: await asyncio.sleep(10)
+            await asyncio.sleep(3)
+        except Exception: await asyncio.sleep(5)
 
 async def main():
     client = await AsyncClient.create(API_KEY, API_SECRET, testnet=True)
     symbols = await setup_filters(client)
-    
-    await send_tg_async(f"⚡️ *CENTURION DEPLOYED*\nScanning `{len(symbols)}` Symbols\nBudget: `$100` | Logic: `Elite HFT`")
-    
-    tasks = [trade_logic(client, s) for s in symbols] + [monitor_portfolio(client)]
+    await send_tg_async(f"❄️ *SNOWBALL MODE ACTIVE*\nCompounding enabled across {len(symbols)} pairs.")
+    tasks = [trade_logic(client, s) for s in symbols]
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
