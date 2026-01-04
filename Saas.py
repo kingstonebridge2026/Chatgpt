@@ -31,7 +31,7 @@ async def scrape_leads(niche: str, location: str):
             await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
             
             # Wait for the results to actually load on the screen
-            await page.wait_for_selector(".result", timeout=15000)
+            await page.wait_for_selector(".result", timeout=30000)
             elements = await page.query_selector_all(".result")
             
             for el in elements[:15]: 
