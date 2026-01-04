@@ -1,19 +1,19 @@
 
-# scalper_with_telegram.py
 """
 Scalping bot with detailed Telegram notifications.
 
 FIXED VERSION:
-- Relaxed entry conditions that were too strict
-- Added diagnostic logging to see why trades aren't triggering
-- Fixed volatility calculation with proper time windowing
-- Added entry signal scoring system
-- Better spread handling
+- Fixed Telegram API call (POST instead of GET)
+- Relaxed entry conditions significantly
+- Added debug logging to track trade conditions
+- Added test trade functionality
+- Better error handling for Telegram
+- More permissive scoring system
 
-- Defaults: PAPER_MODE=True, USE_TESTNET=True
-- Replace env vars BINANCE_API_KEY, BINANCE_API_SECRET, TG_TOKEN, TG_CHAT_ID to run live.
-- Install: pip install python-binance aiohttp pandas numpy
-- Run: python scalper_with_telegram.py
+Defaults: PAPER_MODE=True, USE_TESTNET=True
+Replace env vars BINANCE_API_KEY, BINANCE_API_SECRET, TG_TOKEN, TG_CHAT_ID to run live.
+Install: pip install python-binance aiohttp pandas numpy
+Run: python scalper_with_telegram.py
 """
 
 import os
@@ -39,12 +39,11 @@ USE_TESTNET = True        # keep True for safety while testing
 PAPER_MODE = True         # True = simulate orders, False = send real orders
 
 
-
 SYMBOL_POOL = 20           # Updated to top 20 crypto symbols
 MAX_POSITIONS = 20
 COOLDOWN = 5                 # seconds per symbol after entry
 ENTRY_WAIT = 1.5             # seconds to wait for limit fill before fallback
-MAX_SPREAD_PCT = 0.003       # RELAXED: skip symbols with spread > 0.3% (was 0.2%)
+MAX_SPREAD_PCT = 0.004       # MORE RELAXED: skip symbols with spread > 0.4% (was 0.3%)
 MIN_NOTIONAL = 5.0
 
 TP_PCT = 0.0025              # 0.25% take-profit
@@ -53,26 +52,30 @@ VOL_WINDOW = 30              # seconds of recent trades for micro-volatility
 
 HEARTBEAT_INTERVAL = 300     # seconds
 
-# -------- ENTRY THRESHOLDS (RELAXED) --------
-MIN_OBI_THRESHOLD = 0.03     # RELAXED from 0.08: Order book imbalance threshold (3% instead of 8%)
-MAX_VOL_THRESHOLD = 0.003    # RELAXED from 0.0008: Max volatility (0.3% instead of 0.08%)
-MIN_VOL_THRESHOLD = 0.0001   # NEW: Minimum volatility (need some movement to scalp)
+# -------- ENTRY THRESHOLDS (MORE RELAXED) --------
+MIN_OBI_THRESHOLD = 0.01     # MORE RELAXED: 1% order book imbalance
+MAX_VOL_THRESHOLD = 0.005    # MORE RELAXED: Max 0.5% volatility
+MIN_VOL_THRESHOLD = 0.00005  # LOWER: Minimum volatility
 
-# Scoring system for entries (NEW)
-ENTRY_SCORE_THRESHOLD = 2.0  # Minimum score needed to enter
+# Scoring system - lowered threshold
+ENTRY_SCORE_THRESHOLD = 1.5  # LOWERED from 2.0 to 1.5
 
 # Diagnostic logging interval
 DIAG_LOG_INTERVAL = 30       # Log diagnostics every N seconds per symbol
 
 # logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S"
+)
 
 # ---------------- STATE ----------------
 symbol_filters = {}
 positions = defaultdict(list)   # {symbol: [pos,...]} pos={'p','q','sl','tp','t'}
 last_trade_time = {}
-last_diag_log = {}              # NEW: Track last diagnostic log per symbol
-recent_trades = defaultdict(lambda: deque(maxlen=500))  # INCREASED from 200
+last_diag_log = {}              # Track last diagnostic log per symbol
+recent_trades = defaultdict(lambda: deque(maxlen=500))
 trade_stats = defaultdict(lambda: {'checks': 0, 'obi_pass': 0, 'vol_pass': 0, 'spread_pass': 0, 'entries': 0})
 emergency_stop = False
 
@@ -80,20 +83,34 @@ emergency_stop = False
 async def send_tg_raw(text):
     """Low-level Telegram send; no formatting by default."""
     if not TG_TOKEN or not TG_CHAT_ID:
+        logging.warning("Telegram credentials missing")
         return
+    
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    async with aiohttp.ClientSession() as s:
+    payload = {
+        'chat_id': TG_CHAT_ID,
+        'text': text,
+        'parse_mode': 'HTML'
+    }
+    
+    async with aiohttp.ClientSession() as session:
         try:
-            await s.get(url, params={'chat_id': TG_CHAT_ID, 'text': text})
-        except Exception:
-            pass
+            # FIXED: Changed from GET to POST
+            async with session.post(url, json=payload, timeout=5) as response:
+                if response.status != 200:
+                    response_text = await response.text()
+                    logging.error(f"Telegram API error: {response.status} - {response_text}")
+                else:
+                    logging.debug("Telegram message sent successfully")
+        except Exception as e:
+            logging.error(f"Failed to send Telegram message: {e}")
 
 def _fmt_ts(ts=None):
     t = datetime.datetime.utcfromtimestamp(ts or time.time())
     return t.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 async def send_tg_info(title, body_lines):
-    header = f"{title}\nTime: {_fmt_ts()}\n"
+    header = f"<b>{title}</b>\nTime: {_fmt_ts()}\n"
     body = "\n".join(body_lines)
     msg = header + "\n" + body
     await send_tg_raw(msg)
@@ -206,7 +223,6 @@ async def update_recent_trades(client, symbol):
         dq = recent_trades[symbol]
         now = time.time()
         for t in trades:
-            # Use actual trade time from API, convert from ms to seconds
             trade_time = t.get('time', now * 1000) / 1000.0
             dq.append((float(t['price']), float(t['qty']), t.get('isBuyerMaker', False), trade_time))
     except Exception as e:
@@ -219,23 +235,20 @@ def micro_volatility(symbol):
         return 0.0
     
     now = time.time()
-    # FIXED: Filter trades by time window
     recent = [(p, q, bm, t) for p, q, bm, t in dq if now - t <= VOL_WINDOW]
     
     if len(recent) < 5:
-        # Fallback to all trades if not enough in window
         recent = list(dq)[-50:]
     
     if len(recent) < 5:
         return 0.0
     
     prices = np.array([p for p, _, _, _ in recent])
-    # Coefficient of variation (std / mean)
     vol = float(np.std(prices) / (np.mean(prices) + 1e-9))
     return vol
 
 def calculate_trade_flow(symbol):
-    """NEW: Calculate buy/sell trade flow imbalance from recent trades"""
+    """Calculate buy/sell trade flow imbalance from recent trades"""
     dq = recent_trades[symbol]
     if len(dq) < 10:
         return 0.0
@@ -246,8 +259,8 @@ def calculate_trade_flow(symbol):
     if len(recent) < 5:
         return 0.0
     
-    buy_vol = sum(q for _, q, bm, _ in recent if not bm)  # Taker buys
-    sell_vol = sum(q for _, q, bm, _ in recent if bm)      # Taker sells
+    buy_vol = sum(q for _, q, bm, _ in recent if not bm)
+    sell_vol = sum(q for _, q, bm, _ in recent if bm)
     total = buy_vol + sell_vol
     
     if total == 0:
@@ -255,18 +268,17 @@ def calculate_trade_flow(symbol):
     
     return (buy_vol - sell_vol) / total
 
-async def get_orderbook_imbalance(client, symbol, depth=10):  # INCREASED depth from 5
+async def get_orderbook_imbalance(client, symbol, depth=10):
     try:
         ob = await client.get_order_book(symbol=symbol, limit=depth)
         
         if not ob['bids'] or not ob['asks']:
             return 0.0, 1.0, 0.0
         
-        # Calculate weighted imbalance (closer to spread = more weight)
         bid_vol = 0
         ask_vol = 0
         for i, (b, a) in enumerate(zip(ob['bids'], ob['asks'])):
-            weight = 1.0 / (i + 1)  # Higher weight for levels closer to spread
+            weight = 1.0 / (i + 1)
             bid_vol += float(b[1]) * weight
             ask_vol += float(a[1]) * weight
         
@@ -282,42 +294,97 @@ async def get_orderbook_imbalance(client, symbol, depth=10):  # INCREASED depth 
 
 def calculate_entry_score(obi, vol, spread, trade_flow):
     """
-    NEW: Calculate a composite entry score instead of hard thresholds.
-    This allows trades even when individual metrics are slightly off.
+    RELAXED scoring system
     """
     score = 0.0
     
-    # OBI contribution (0-2 points)
-    if obi > 0.10:
+    # OBI contribution - more generous
+    if obi > 0.05:
         score += 2.0
-    elif obi > 0.05:
-        score += 1.5
     elif obi > 0.02:
-        score += 1.0
+        score += 1.5
     elif obi > 0.01:
+        score += 1.0
+    elif obi > 0.005:
         score += 0.5
     
-    # Volatility contribution (0-1 points) - want moderate volatility
+    # Volatility contribution - wider range
     if MIN_VOL_THRESHOLD < vol < MAX_VOL_THRESHOLD:
         score += 1.0
-    elif vol < MAX_VOL_THRESHOLD * 1.5:
+    elif vol < MAX_VOL_THRESHOLD * 2.0:
         score += 0.5
     
-    # Spread contribution (0-1 points) - lower is better
+    # Spread contribution - more tolerant
     if spread < 0.001:
         score += 1.0
     elif spread < 0.002:
-        score += 0.5
+        score += 0.75
     elif spread < MAX_SPREAD_PCT:
+        score += 0.5
+    elif spread < MAX_SPREAD_PCT * 1.5:
         score += 0.25
     
-    # Trade flow contribution (0-1 points)
-    if trade_flow > 0.15:
+    # Trade flow contribution - more sensitive
+    if abs(trade_flow) > 0.10:
         score += 1.0
-    elif trade_flow > 0.05:
+    elif abs(trade_flow) > 0.05:
         score += 0.5
     
     return score
+
+async def debug_trade_conditions(client, symbol):
+    """Debug function to see current market conditions"""
+    await update_recent_trades(client, symbol)
+    obi, spread, mid = await get_orderbook_imbalance(client, symbol, depth=10)
+    vol = micro_volatility(symbol)
+    trade_flow = calculate_trade_flow(symbol)
+    score = calculate_entry_score(obi, vol, spread, trade_flow)
+    
+    logging.info(f"🔍 DEBUG {symbol}:")
+    logging.info(f"  - Mid Price: {mid}")
+    logging.info(f"  - OBI: {obi:.4f} (threshold: >{MIN_OBI_THRESHOLD})")
+    logging.info(f"  - Volatility: {vol:.6f} (range: {MIN_VOL_THRESHOLD} to {MAX_VOL_THRESHOLD})")
+    logging.info(f"  - Spread: {spread:.4%} (max: {MAX_SPREAD_PCT:.2%})")
+    logging.info(f"  - Trade Flow: {trade_flow:.4f}")
+    logging.info(f"  - Entry Score: {score:.2f} (need: {ENTRY_SCORE_THRESHOLD})")
+    
+    conditions = {
+        "Spread OK": spread <= MAX_SPREAD_PCT,
+        "OBI OK": obi > MIN_OBI_THRESHOLD,
+        "Volatility OK": MIN_VOL_THRESHOLD < vol < MAX_VOL_THRESHOLD,
+        "Score OK": score >= ENTRY_SCORE_THRESHOLD
+    }
+    
+    for condition, passed in conditions.items():
+        status = "✅ PASS" if passed else "❌ FAIL"
+        logging.info(f"  - {condition}: {status}")
+    
+    return conditions
+
+async def force_test_trade(client, symbol):
+    """Force a test trade to verify everything works"""
+    logging.info(f"🔧 FORCING TEST TRADE FOR {symbol}")
+    
+    if PAPER_MODE:
+        usd_alloc = 10.0
+        ticker = await client.get_symbol_ticker(symbol=symbol)
+        mid = float(ticker['price'])
+        
+        entry_price = mid
+        q = 0.001
+        sl = entry_price * (1 - SL_PCT)
+        tp = entry_price * (1 + TP_PCT)
+        
+        positions[symbol].append({'p': entry_price, 'q': q, 'sl': sl, 'tp': tp, 't': time.time()})
+        
+        await send_tg_entry(
+            symbol=symbol, side="BUY", qty=q, entry_price=entry_price,
+            sl=sl, tp=tp, usd_alloc=usd_alloc, score=99.9, filled=True
+        )
+        
+        logging.info(f"✅ Test trade simulated for {symbol}")
+        return True
+    return False
 
 # ---------------- ENTRY / EXIT ----------------
 async def try_entry(client, symbol, mid_price, usd_alloc):
@@ -328,7 +395,7 @@ async def try_entry(client, symbol, mid_price, usd_alloc):
         logging.debug("Entry skipped for %s: qty=%s, alloc=%s, min_notional=%s", symbol, qty, usd_alloc, min_notional)
         return None
 
-    limit_price = round(mid_price * 0.9998, 8)  # ADJUSTED: slightly better price (was 0.9995)
+    limit_price = round(mid_price * 0.9998, 8)
     try:
         if PAPER_MODE:
             filled = True
@@ -344,7 +411,6 @@ async def try_entry(client, symbol, mid_price, usd_alloc):
                 if o['status'] == 'FILLED':
                     return {'entry_price': float(o['price']), 'q': qty, 'filled': True}
                 await asyncio.sleep(0.15)
-            # cancel and fallback to market
             await client.cancel_order(symbol=symbol, orderId=order['orderId'])
             m = await client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
             return {'entry_price': mid_price, 'q': qty, 'filled': True}
@@ -408,7 +474,7 @@ async def scalper_loop(client, symbol):
             # Calculate entry score
             score = calculate_entry_score(obi, vol, spread, trade_flow)
             
-            # Diagnostic logging (not too frequent)
+            # Diagnostic logging
             if now - last_diag_log.get(symbol, 0) > DIAG_LOG_INTERVAL:
                 logging.info(
                     "📊 %s | OBI: %.4f | Vol: %.6f | Spread: %.4f | Flow: %.4f | Score: %.2f",
@@ -428,10 +494,9 @@ async def scalper_loop(client, symbol):
                     acc = await client.get_account()
                     usdt_free = float(next((b['free'] for b in acc['balances'] if b['asset'] == 'USDT'), 0.0))
                 
-                # Scale allocation by score (higher score = more confidence)
-                base_alloc = usdt_free * 0.01  # INCREASED from 0.5% to 1% per scalp
-                score_multiplier = min(1.5, score / ENTRY_SCORE_THRESHOLD)  # Up to 1.5x for strong signals
-                vol_adj = max(0.5, 1.0 - (vol * 100))  # Reduce size if vol high
+                base_alloc = usdt_free * 0.01
+                score_multiplier = min(1.5, score / ENTRY_SCORE_THRESHOLD)
+                vol_adj = max(0.5, 1.0 - (vol * 100))
                 usd_alloc = base_alloc * score_multiplier * vol_adj
 
                 if usd_alloc >= MIN_NOTIONAL:
@@ -475,15 +540,13 @@ async def scalper_loop(client, symbol):
                 elif price >= pos['tp']:
                     exit_triggered = True
                     reason = "TP"
-                elif obi < -0.05:  # RELAXED from -0.08: Exit on bearish imbalance
+                elif obi < -0.05:
                     exit_triggered = True
                     reason = "Bearish Signal"
-                elif trade_flow < -0.15:  # NEW: Exit on heavy selling
+                elif trade_flow < -0.15:
                     exit_triggered = True
                     reason = "Sell Pressure"
-                
-                # Time-based exit (don't hold too long for scalping)
-                elif now - pos['t'] > 120:  # 2 minutes max hold time
+                elif now - pos['t'] > 120:
                     exit_triggered = True
                     reason = "Time Limit"
                 
@@ -498,7 +561,7 @@ async def scalper_loop(client, symbol):
                             reason=reason, realized_usdt=realized
                         )
 
-            await asyncio.sleep(0.5)  # FASTER loop (was 0.9)
+            await asyncio.sleep(0.5)
         except Exception as e:
             logging.exception("Loop error %s: %s", symbol, e)
             await send_tg_error(symbol, e)
@@ -506,7 +569,7 @@ async def scalper_loop(client, symbol):
 
 # ---------------- HEARTBEAT ----------------
 async def heartbeat_task(client, symbols, interval=HEARTBEAT_INTERVAL):
-    await asyncio.sleep(30)  # Initial delay to collect some stats
+    await asyncio.sleep(30)
     while True:
         try:
             if PAPER_MODE:
@@ -515,7 +578,6 @@ async def heartbeat_task(client, symbols, interval=HEARTBEAT_INTERVAL):
                 acc = await client.get_account()
                 usdt_free = float(next((b['free'] for b in acc['balances'] if b['asset'] == 'USDT'), 0.0))
             
-            # Aggregate stats
             total_checks = sum(s['checks'] for s in trade_stats.values())
             total_obi = sum(s['obi_pass'] for s in trade_stats.values())
             total_vol = sum(s['vol_pass'] for s in trade_stats.values())
@@ -552,12 +614,11 @@ async def heartbeat_task(client, symbols, interval=HEARTBEAT_INTERVAL):
 
 # ---------------- STARTUP DIAGNOSTICS ----------------
 async def run_startup_diagnostics(client, symbols):
-    """NEW: Run quick diagnostics to verify conditions are achievable"""
     logging.info("🔍 Running startup diagnostics on %d symbols...", len(symbols))
     
     results = {'spread_ok': 0, 'obi_ok': 0, 'vol_ok': 0, 'total': len(symbols)}
     
-    for symbol in symbols[:10]:  # Check first 10 symbols
+    for symbol in symbols[:10]:
         await update_recent_trades(client, symbol)
         obi, spread, mid = await get_orderbook_imbalance(client, symbol, depth=10)
         vol = micro_volatility(symbol)
@@ -597,21 +658,41 @@ async def main():
                  MIN_OBI_THRESHOLD, MAX_VOL_THRESHOLD, MAX_SPREAD_PCT, ENTRY_SCORE_THRESHOLD)
     logging.info("=" * 60)
     
+    # First, test Telegram
+    logging.info("Testing Telegram connection...")
+    await send_tg_raw("🤖 Scalper bot starting up...")
+    logging.info("Telegram test message sent")
+    
     client = await AsyncClient.create(API_KEY, API_SECRET, testnet=USE_TESTNET)
     symbols = await setup_filters(client)
     logging.info("✅ Loaded %d tradeable symbols", len(symbols))
     
-    # Run startup diagnostics
-    await run_startup_diagnostics(client, symbols)
+    if not symbols:
+        logging.error("❌ No symbols found!")
+        await send_tg_raw("❌ ERROR: No trading symbols found")
+        return
     
+    # Run startup diagnostics
+    diag_results = await run_startup_diagnostics(client, symbols)
+    
+    # Send startup message
     await send_tg_info("🚀 Scalper Started", [
         f"Symbols: {len(symbols)}",
         f"Paper mode: {PAPER_MODE}",
         f"Testnet: {USE_TESTNET}",
         f"Entry Score Threshold: {ENTRY_SCORE_THRESHOLD}",
-        f"OBI Threshold: {MIN_OBI_THRESHOLD}",
-        f"Max Volatility: {MAX_VOL_THRESHOLD}"
+        f"Diagnostics: Spread OK: {diag_results['spread_ok']}/10, OBI OK: {diag_results['obi_ok']}/10"
     ])
+    
+    # Optionally force a test trade on first symbol (for debugging)
+    if len(symbols) > 0:
+        test_symbol = symbols[0]
+        logging.info(f"Testing trade conditions for {test_symbol}...")
+        await debug_trade_conditions(client, test_symbol)
+        
+        # Uncomment to force a test trade immediately
+        # logging.info("Forcing test trade...")
+        # await force_test_trade(client, test_symbol)
 
     # Warm recent trades
     logging.info("⏳ Warming up trade data...")
@@ -620,12 +701,40 @@ async def main():
         await asyncio.sleep(0.05)
     logging.info("✅ Trade data warmed up")
 
+    # Start tasks
     tasks = [scalper_loop(client, s) for s in symbols]
     tasks.append(heartbeat_task(client, symbols, interval=HEARTBEAT_INTERVAL))
-    await asyncio.gather(*tasks)
+    
+    logging.info("✅ Starting %d trading loops", len(tasks))
+    
+    try:
+        await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        logging.info("⛔ Stopped by user")
+        await send_tg_raw("⛔ Bot stopped by user")
+    except Exception as e:
+        logging.exception("Fatal error: %s", e)
+        await send_tg_error("main", e)
 
 if __name__ == "__main__":
+    # Check environment variables
+    missing = []
+    if not API_KEY:
+        missing.append("BINANCE_API_KEY")
+    if not API_SECRET:
+        missing.append("BINANCE_API_SECRET")
+    if not TG_TOKEN:
+        missing.append("TG_TOKEN")
+    if not TG_CHAT_ID:
+        missing.append("TG_CHAT_ID")
+    
+    if missing:
+        logging.warning("⚠️ Missing environment variables: %s", ", ".join(missing))
+        logging.info("Using defaults: PAPER_MODE=True, USE_TESTNET=True")
+    
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("⛔ Stopped by user")
+    except Exception as e:
+        logging.exception("Fatal error: %s", e)
