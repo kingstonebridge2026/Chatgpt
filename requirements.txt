@@ -9,4 +9,5 @@ python-telegram-bot
 river
 nltk
 requests
+python-binance
 
